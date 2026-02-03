@@ -1,0 +1,23 @@
+# Kind Cluster Configuration
+# Multi-node cluster setup suitable for Codespaces
+
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: kind-cluster
+
+# Network configuration
+networking:
+  podSubnet: "10.244.0.0/16"
+  serviceSubnet: "10.96.0.0/12"
+
+# Node configuration
+nodes:
+  # Control plane node
+  - role: control-plane
+    image: kindest/node:v1.29.0
+
+  # Worker nodes
+  - role: worker
+    image: kindest/node:v1.29.0
+  - role: worker
+    image: kindest/node:v1.29.0
