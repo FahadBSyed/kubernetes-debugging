@@ -351,16 +351,8 @@ fi
 # ============================================================================
 if should_run 11; then
     print_step "11" "Create 'demo' namespace and deploy nginx"
-
-    echo "Creating namespace 'demo' (if missing)..."
-    kubectl create namespace demo >/dev/null 2>&1 || true
-
-    echo "Applying nginx manifest into namespace 'demo'..."
-    kubectl apply -f "$SCRIPT_DIR/nginx-deployment.yaml"
-
-    echo "Waiting for nginx pods to become ready..."
-    kubectl -n demo wait --for=condition=ready pod -l app=nginx --timeout=120s || true
-    kubectl -n demo get pods -o wide
+    "$SCRIPT_DIR/scripts/deploy-nginx.sh"
+    echo ""
 fi
 
 # ============================================================================
@@ -368,154 +360,23 @@ fi
 # ============================================================================
 if should_run 12; then
     print_step "12" "Install MetalLB (LoadBalancer for Kind)"
-
-    METALLB_URL="https://raw.githubusercontent.com/metallb/metallb/refs/tags/v0.13.12/config/manifests/metallb-native.yaml"
-    LOCAL_METALLB_MANIFEST="$SCRIPT_DIR/config/metallb-native.yaml"
-
-    echo "Installing MetalLB manifests..."
-    # Try to download the exact manifest and save as a local backup; fall back to local copy if download fails
-    if command -v curl >/dev/null 2>&1; then
-        if curl -fsSL "$METALLB_URL" -o "$LOCAL_METALLB_MANIFEST"; then
-            echo "Saved MetalLB manifest to $LOCAL_METALLB_MANIFEST"
-            kubectl apply -f "$LOCAL_METALLB_MANIFEST"
-        else
-            echo "Could not fetch $METALLB_URL"
-            if [ -f "$LOCAL_METALLB_MANIFEST" ]; then
-                echo "Using existing local manifest: $LOCAL_METALLB_MANIFEST"
-                kubectl apply -f "$LOCAL_METALLB_MANIFEST"
-            else
-                echo "Error: MetalLB manifest unavailable (network failure and no local backup)."
-                exit 1
-            fi
-        fi
-    else
-        echo "curl is not available; attempting to use local manifest if present"
-        if [ -f "$LOCAL_METALLB_MANIFEST" ]; then
-            kubectl apply -f "$LOCAL_METALLB_MANIFEST"
-        else
-            echo "Error: curl not found and no local MetalLB manifest available. Install curl or add $LOCAL_METALLB_MANIFEST"
-            exit 1
-        fi
-    fi
-
-    echo "Waiting for MetalLB pods to be ready..."
-    sleep 3
-    max=30
-    count=0
-    while [ $count -lt $max ]; do
-        ready=$(kubectl -n metallb-system get pods --no-headers 2>/dev/null | grep -c "Running" || true)
-        total=$(kubectl -n metallb-system get pods --no-headers 2>/dev/null | wc -l || true)
-        if [ "$total" -gt 0 ] && [ "$ready" -eq "$total" ]; then
-            echo "✓ MetalLB pods are running"
-            break
-        fi
-        echo "Waiting for MetalLB pods ($ready/$total)"
-        sleep 2
-        count=$((count+1))
-    done
-
-    if [ $count -eq $max ]; then
-        echo "${YELLOW}Warning: MetalLB pods may not be ready yet${NC}"
-    fi
+    "$SCRIPT_DIR/scripts/install-metallb.sh"
+    echo ""
 fi
 
 if should_run 13; then
-    print_step "13" "Configure MetalLB IPAddressPool & L2Advertisement"
-
-METALLB_CFG="$SCRIPT_DIR/config/metallb-pool.yaml"
-if [ ! -f "$METALLB_CFG" ]; then
-    cat > "$METALLB_CFG" <<EOF
-apiVersion: metallb.io/v1beta1
-kind: IPAddressPool
-metadata:
-    name: kind-pool
-    namespace: metallb-system
-spec:
-    addresses:
-    - 172.18.0.240-172.18.0.250
----
-apiVersion: metallb.io/v1beta1
-kind: L2Advertisement
-metadata:
-    name: l2
-    namespace: metallb-system
-spec: {}
-EOF
-    echo "Created $METALLB_CFG"
-fi
-
-    kubectl apply -f "$METALLB_CFG"
-    echo "Configured MetalLB IP pool"
+    # Step 13 is now combined with Step 12 in install-metallb.sh
+    true
 fi
 
 if should_run 14; then
     print_step "14" "Expose nginx as LoadBalancer and wait for external IP"
-
-    echo "Patching nginx service to LoadBalancer..."
-    kubectl -n demo patch svc nginx -p '{"spec":{"type":"LoadBalancer"}}' --kubeconfig "$KUBE_CONFIG" || true
-
-    echo "Waiting for external IP assignment (MetalLB)..."
-    LB_IP=""
-    attempt=0
-    max_attempts=60
-    while [ $attempt -lt $max_attempts ]; do
-        LB_IP=$(kubectl -n demo get svc nginx --kubeconfig "$KUBE_CONFIG" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
-        if [ -n "$LB_IP" ]; then
-            echo "✓ External IP assigned: $LB_IP"
-            break
-        fi
-        echo "Waiting for external IP... ($attempt/$max_attempts)"
-        sleep 2
-        attempt=$((attempt+1))
-    done
-
-    if [ -z "$LB_IP" ]; then
-        echo "${YELLOW}Warning: LoadBalancer IP not assigned. MetalLB may not have configured the pool correctly.${NC}"
-    else
-        echo "LoadBalancer IP: $LB_IP"
-    fi
+    "$SCRIPT_DIR/scripts/expose-loadbalancer.sh"
+    echo ""
 fi
 
 if should_run 15; then
     print_step "15" "Test connectivity to NGinx"
-
-    LB_IP=""
-    attempt=0
-    max_attempts=60
-    while [ $attempt -lt $max_attempts ]; do
-        LB_IP=$(kubectl -n demo get svc nginx --kubeconfig "$KUBE_CONFIG" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
-        if [ -n "$LB_IP" ]; then
-            echo "✓ External IP assigned: $LB_IP"
-            break
-        fi
-        echo "Waiting for external IP... ($attempt/$max_attempts)"
-        sleep 2
-        attempt=$((attempt+1))
-    done
-
-    # Try curling the service a few times; hide output on success and only print the URL:port
-    if [ -z "$LB_IP" ]; then
-        echo "${YELLOW}Warning: no LoadBalancer IP available to test connectivity.${NC}"
-    else
-        CURL_RETRIES=5
-        CURL_ATTEMPT=1
-        SUCCESS=0
-        while [ $CURL_ATTEMPT -le $CURL_RETRIES ]; do
-            if curl -sS --max-time 5 "http://$LB_IP:80" >/dev/null 2>&1; then
-                # Successful probe; only show the reachable URL and port
-                echo -e "${GREEN}✓ Nginx reachable at: http://$LB_IP:80${NC}"
-                SUCCESS=1
-                break
-            else
-                if [ $CURL_ATTEMPT -lt $CURL_RETRIES ]; then
-                    sleep 2
-                fi
-            fi
-            CURL_ATTEMPT=$((CURL_ATTEMPT+1))
-        done
-
-        if [ $SUCCESS -ne 1 ]; then
-            echo "${YELLOW}Warning: nginx did not respond at http://$LB_IP:80 after $CURL_RETRIES attempts.${NC}"
-        fi
-    fi
+    "$SCRIPT_DIR/scripts/test-connectivity.sh"
+    echo ""
 fi
